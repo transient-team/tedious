@@ -345,11 +345,13 @@ class Connection extends EventEmitter {
       }
       deprecateNullFallbackToDefaultConfigValue('options.enableQuotedIdentifier', config.options.enableQuotedIdentifier);
 
-      if (config.options.encrypt != undefined) {
-        deprecateNonBooleanConfigValue('options.encrypt', config.options.encrypt);
+      if (config.options.encrypt !== undefined) {
+        if (typeof config.options.encrypt !== 'boolean') {
+          throw new TypeError('options.encrypt must be a boolean (true or false).');
+        }
+
         this.config.options.encrypt = config.options.encrypt;
       }
-      deprecateNullConfigValue('options.encrypt', config.options.encrypt);
 
       if (config.options.fallbackToDefaultDb != undefined) {
         deprecateNonBooleanConfigValue('options.fallbackToDefaultDb', config.options.fallbackToDefaultDb);
