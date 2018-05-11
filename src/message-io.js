@@ -1,138 +1,191 @@
-// @flow
-
-/* globals $Values */
-
-import type Debug from './debug';
-import type { Duplex } from 'stream';
-import type { TLSSocket } from 'tls';
-import type { Socket } from 'net';
-
 const tls = require('tls');
 const crypto = require('crypto');
-const DuplexPair = require('native-duplexpair');
-const { EventEmitter} = require('events');
+const EventEmitter = require('events').EventEmitter;
+const Transform = require('readable-stream').Transform;
 
-const { TYPE } = require('./packet');
+const Packet = require('./packet').Packet;
+const TYPE = require('./packet').TYPE;
+const packetHeaderLength = require('./packet').HEADER_LENGTH;
 
-const Message = require('./message');
-const IncomingMessageStream = require('./incoming-message-stream');
-const OutgoingMessageStream = require('./outgoing-message-stream');
+class ReadablePacketStream extends Transform {
+  constructor() {
+    super({ objectMode: true });
 
-module.exports = class MessageIO extends EventEmitter {
-  socket: Socket;
-  debug: Debug;
-
-  tlsNegotiationComplete: boolean;
-
-  incomingMessageStream: IncomingMessageStream;
-  outgoingMessageStream: OutgoingMessageStream;
-
-  securePair: {
-    cleartext: TLSSocket,
-    encrypted: Duplex
+    this.buffer = Buffer.alloc(0);
+    this.position = 0;
   }
 
-  constructor(socket: Socket, packetSize: number, debug: Debug) {
+  _transform(chunk, encoding, callback) {
+    if (this.position === this.buffer.length) {
+      // If we have fully consumed the previous buffer,
+      // we can just replace it with the new chunk
+      this.buffer = chunk;
+    } else {
+      // If we haven't fully consumed the previous buffer,
+      // we simply concatenate the leftovers and the new chunk.
+      this.buffer = Buffer.concat([
+        this.buffer.slice(this.position), chunk
+      ], (this.buffer.length - this.position) + chunk.length);
+    }
+
+    this.position = 0;
+
+    // The packet header is always 8 bytes of length.
+    while (this.buffer.length >= this.position + packetHeaderLength) {
+      // Get the full packet length
+      const length = this.buffer.readUInt16BE(this.position + 2);
+
+      if (this.buffer.length >= this.position + length) {
+        const data = this.buffer.slice(this.position, this.position + length);
+        this.position += length;
+        this.push(new Packet(data));
+      } else {
+        // Not enough data to provide the next packet. Stop here and wait for
+        // the next call to `_transform`.
+        break;
+      }
+    }
+
+    callback();
+  }
+}
+
+module.exports = class MessageIO extends EventEmitter {
+  constructor(socket, _packetSize, debug) {
     super();
 
     this.socket = socket;
+    this._packetSize = _packetSize;
     this.debug = debug;
 
-    this.tlsNegotiationComplete = false;
-
-    this.incomingMessageStream = new IncomingMessageStream(this.debug);
-    this.incomingMessageStream.on('data', (message) => {
-      message.on('data', (chunk) => { this.emit('data', chunk); });
-      message.on('end', () => { this.emit('message'); });
+    this.packetStream = new ReadablePacketStream();
+    this.packetStream.on('data', (packet) => {
+      this.logPacket('Received', packet);
+      this.emit('data', packet.data());
+      if (packet.isLast()) {
+        this.emit('message');
+      }
     });
 
-    this.outgoingMessageStream = new OutgoingMessageStream(this.debug, { packetSize: packetSize });
-
-    this.socket.pipe(this.incomingMessageStream);
-    this.outgoingMessageStream.pipe(this.socket);
+    this.socket.pipe(this.packetStream);
+    this.packetDataSize = this._packetSize - packetHeaderLength;
   }
 
-  packetSize(...args: [number]) {
-    if (args.length > 0) {
-      const packetSize = args[0];
-      this.debug.log('Packet size changed from ' + this.outgoingMessageStream.packetSize + ' to ' + packetSize);
-      this.outgoingMessageStream.packetSize = packetSize;
+  packetSize(packetSize) {
+    if (arguments.length > 0) {
+      this.debug.log('Packet size changed from ' + this._packetSize + ' to ' + packetSize);
+      this._packetSize = packetSize;
+      this.packetDataSize = this._packetSize - packetHeaderLength;
     }
-    return this.outgoingMessageStream.packetSize;
+    return this._packetSize;
   }
 
-  startTls(credentialsDetails: Object, hostname: string, trustServerCertificate: boolean) {
+  startTls(credentialsDetails, hostname, trustServerCertificate) {
     const credentials = tls.createSecureContext ? tls.createSecureContext(credentialsDetails) : crypto.createCredentials(credentialsDetails);
 
-    const duplexpair = new DuplexPair();
-    const securePair = this.securePair = {
-      cleartext: tls.connect({
-        socket: duplexpair.socket1,
-        servername: hostname,
-        secureContext: credentials,
-        rejectUnauthorized: !trustServerCertificate
-      }),
-      encrypted: duplexpair.socket2
-    };
+    this.securePair = tls.createSecurePair(credentials);
+    this.tlsNegotiationComplete = false;
 
-    // If an error happens in the TLS layer, there is nothing we can do about it.
-    // Forward the error to the socket so the connection gets properly cleaned up.
-    securePair.cleartext.on('error', (err) => {
-      // Streams in node.js versions before 8.0.0 don't support `.destroy`
-      if (typeof securePair.encrypted.destroy === 'function') {
-        securePair.encrypted.destroy();
-      }
-      this.socket.destroy(err);
-    });
+    this.securePair.on('secure', () => {
+      const cipher = this.securePair.cleartext.getCipher();
 
-    securePair.cleartext.on('secureConnect', () => {
-      const cipher = securePair.cleartext.getCipher();
-      if (cipher) {
-        this.debug.log('TLS negotiated (' + cipher.name + ', ' + cipher.version + ')');
+      if (!trustServerCertificate) {
+        let verifyError = this.securePair.ssl.verifyError();
+
+        // Verify that server's identity matches it's certificate's names
+        if (!verifyError) {
+          verifyError = tls.checkServerIdentity(hostname, this.securePair.cleartext.getPeerCertificate());
+        }
+
+        if (verifyError) {
+          this.securePair.destroy();
+          this.socket.destroy(verifyError);
+          return;
+        }
       }
-      this.emit('secure', securePair.cleartext);
+
+      this.debug.log('TLS negotiated (' + cipher.name + ', ' + cipher.version + ')');
+      this.emit('secure', this.securePair.cleartext);
       this.encryptAllFutureTraffic();
     });
 
-    securePair.encrypted.on('data', (data) => {
-      this.sendMessage(TYPE.PRELOGIN, data, false);
+    this.securePair.encrypted.on('data', (data) => {
+      this.sendMessage(TYPE.PRELOGIN, data);
     });
+
+    // On Node >= 0.12, the encrypted stream automatically starts spewing out
+    // data once we attach a `data` listener. But on Node <= 0.10.x, this is not
+    // the case. We need to kick the cleartext stream once to get the
+    // encrypted end of the secure pair to emit the TLS handshake data.
+    this.securePair.cleartext.write('');
   }
 
   encryptAllFutureTraffic() {
+    this.socket.unpipe(this.packetStream);
     this.securePair.encrypted.removeAllListeners('data');
-
-    this.outgoingMessageStream.unpipe(this.socket);
-    this.socket.unpipe(this.incomingMessageStream);
-
     this.socket.pipe(this.securePair.encrypted);
     this.securePair.encrypted.pipe(this.socket);
-
-    this.securePair.cleartext.pipe(this.incomingMessageStream);
-    this.outgoingMessageStream.pipe(this.securePair.cleartext);
-
+    this.securePair.cleartext.pipe(this.packetStream);
     this.tlsNegotiationComplete = true;
   }
 
-  tlsHandshakeData(data: Buffer) {
+  tlsHandshakeData(data) {
     this.securePair.encrypted.write(data);
   }
 
   // TODO listen for 'drain' event when socket.write returns false.
   // TODO implement incomplete request cancelation (2.2.1.6)
-  sendMessage(packetType: $Values<typeof TYPE>, data: Buffer, resetConnection: boolean) {
-    const message = new Message({ type: packetType, resetConnection: resetConnection });
-    message.end(data);
-    this.outgoingMessageStream.write(message);
+  sendMessage(packetType, data, resetConnection) {
+    let numberOfPackets;
+    if (data) {
+      numberOfPackets = (Math.floor((data.length - 1) / this.packetDataSize)) + 1;
+    } else {
+      numberOfPackets = 1;
+      data = Buffer.alloc(0);
+    }
+
+    for (let packetNumber = 0; packetNumber < numberOfPackets; packetNumber++) {
+      const payloadStart = packetNumber * this.packetDataSize;
+
+      let payloadEnd;
+      if (packetNumber < numberOfPackets - 1) {
+        payloadEnd = payloadStart + this.packetDataSize;
+      } else {
+        payloadEnd = data.length;
+      }
+
+      const packetPayload = data.slice(payloadStart, payloadEnd);
+
+      const packet = new Packet(packetType);
+      packet.last(packetNumber === numberOfPackets - 1);
+      packet.resetConnection(resetConnection);
+      packet.packetId(packetNumber + 1);
+      packet.addData(packetPayload);
+      this.sendPacket(packet);
+    }
+  }
+
+  sendPacket(packet) {
+    this.logPacket('Sent', packet);
+    if (this.securePair && this.tlsNegotiationComplete) {
+      this.securePair.cleartext.write(packet.buffer);
+    } else {
+      this.socket.write(packet.buffer);
+    }
+  }
+
+  logPacket(direction, packet) {
+    this.debug.packet(direction, packet);
+    this.debug.data(packet);
   }
 
   // Temporarily suspends the flow of incoming packets.
   pause() {
-    this.incomingMessageStream.pause();
+    this.packetStream.pause();
   }
 
   // Resumes the flow of incoming packets.
   resume() {
-    this.incomingMessageStream.resume();
+    this.packetStream.resume();
   }
 };
